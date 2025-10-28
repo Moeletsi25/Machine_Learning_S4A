@@ -1,0 +1,185 @@
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from datetime import datetime, timedelta
+import prophet 
+from prophet import Prophet
+import io
+
+st.set_page_config(page_title="Follower Forecast", layout="wide")
+st.title("📈 Follower-growth prediction (Linear-Regression vs Prophet)")
+
+# ------------------------------------------------------------------ #
+# 1. DATA INPUT
+# ------------------------------------------------------------------ #
+uploaded_file = st.file_uploader(
+    "Upload CSV (columns: Date, Sponsored, Organic, Auto_invited, Total)",
+    type=["csv"],
+)
+
+# Demo mode: use a built-in dummy file so the app works out-of-the-box
+USE_DEMO = uploaded_file is None
+if USE_DEMO:
+    st.info("No file uploaded → running built-in demo data")
+    # create 300 days of synthetic data
+    dates = pd.date_range(end=datetime.today(), periods=300, freq="D")
+    rng = np.random.default_rng(42)
+    demo = pd.DataFrame(
+        {
+            "Date": dates,
+            "Sponsored": rng.poisson(5, 300),
+            "Organic": rng.poisson(15, 300),
+            "Auto_invited": rng.poisson(3, 300),
+        }
+    )
+    demo["Total"] = demo["Sponsored"] + demo["Organic"] + demo["Auto_invited"]
+    # make a few zero-days
+    zero_idx = rng.choice(demo.index, size=30, replace=False)
+    demo.loc[zero_idx, "Total"] = 0
+    df = demo
+else:
+    df = pd.read_csv(uploaded_file)
+
+# ------------------------------------------------------------------ #
+# 2. CLEANING / FEATURE ENGINEERING
+# ------------------------------------------------------------------ #
+df.columns = ["Date", "Sponsored", "Organic", "Auto_invited", "Total"]
+df["Date"] = pd.to_datetime(df["Date"])
+df = df.sort_values("Date").reset_index(drop=True)
+# fix negative totals
+df.loc[df["Total"] < 0, "Total"] = 0
+df["Cumu_followers"] = df["Total"].cumsum()
+df["Month"] = df["Date"].dt.to_period("M")
+# feature matrix for LR
+df["FM"] = np.arange(1, len(df) + 1)
+
+# ------------------------------------------------------------------ #
+# 3. EDA
+# ------------------------------------------------------------------ #
+st.header("1. Quick EDA")
+left, right = st.columns(2)
+with left:
+    st.metric("Days with zero adds", f"{(df['Total']==0).sum()} / {len(df)}")
+with right:
+    st.metric("Average daily adds", f"{df['Total'].mean():.1f}")
+
+st.subheader("Daily adds summary")
+st.dataframe(df["Total"].describe())
+
+monthly = df.groupby("Month")["Total"].sum().astype(int)
+st.subheader("Monthly new followers")
+st.dataframe(monthly)
+
+# ------------------------------------------------------------------ #
+# 4. MODEL TRAINING
+# ------------------------------------------------------------------ #
+target_date = datetime(2025, 12, 31)
+last_day = df["Date"].max()
+delta_day = (target_date - last_day).days
+
+# --- Linear Regression --- #
+X = df[["FM"]]
+Y = df["Cumu_followers"]
+lr = LinearRegression().fit(X, Y)
+future_x = np.array([[len(df) + delta_day]])
+lr_pred = lr.predict(future_x)[0]
+residuals = Y - lr.predict(X)
+std_err = residuals.std()
+lr_lower, lr_upper = lr_pred - std_err, lr_pred + std_err
+
+# --- Prophet --- #
+prophet_df = df[["Date", "Cumu_followers"]].rename(columns={"Date": "ds", "Cumu_followers": "y"})
+m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False,
+            changepoint_prior_scale=0.05)
+m.fit(prophet_df)
+future_df = m.make_future_dataframe(periods=delta_day)
+forecast = m.predict(future_df)
+row_tgt = forecast[forecast["ds"] == target_date]
+phat = row_tgt["yhat"].values[0]
+phat_lower = row_tgt["yhat_lower"].values[0]
+phat_upper = row_tgt["yhat_upper"].values[0]
+
+# ------------------------------------------------------------------ #
+# 5. PERFORMANCE ON HISTORICAL DATA
+# ------------------------------------------------------------------ #
+prophet_hist = forecast[forecast["ds"].isin(df["Date"])]["yhat"].values
+lr_mae = mean_absolute_error(Y, lr.predict(X))
+lr_rmse = np.sqrt(mean_squared_error(Y, lr.predict(X)))
+ph_mae = mean_absolute_error(Y, prophet_hist)
+ph_rmse = np.sqrt(mean_squared_error(Y, prophet_hist))
+
+# ------------------------------------------------------------------ #
+# 6. RESULTS
+# ------------------------------------------------------------------ #
+st.header("2. 31-Dec-2025 prediction")
+c1, c2, c3 = st.columns(3)
+c1.metric("Linear Regression", f"{lr_pred:,.0f}",
+          delta=f"{lr_upper-lr_pred:,.0f} ‑ {lr_pred-lr_lower:,.0f} (±1σ)")
+c2.metric("Prophet", f"{phat:,.0f}",
+          delta=f"{phat_upper-phat:,.0f} ‑ {phat-phat_lower:,.0f} (80 %)")
+c3.metric("Difference", f"{abs(lr_pred-phat):,.0f} ({abs(lr_pred-phat)/lr_pred*100:.1f} %)")
+
+st.header("3. Model performance (historical)")
+perf = pd.DataFrame({"MAE": [lr_mae, ph_mae], "RMSE": [lr_rmse, ph_rmse]},
+                    index=["Linear Regression", "Prophet"])
+st.dataframe(perf.style.format("{:.2f}"))
+
+# ------------------------------------------------------------------ #
+# 7. PLOTS
+# ------------------------------------------------------------------ #
+st.header("4. Visualisations")
+
+# --- 7a. Daily adds scatter --- #
+fig1, ax1 = plt.subplots(figsize=(14, 4))
+sns.scatterplot(x="Date", y="Total", data=df, color="red", alpha=0.6, ax=ax1)
+ax1.set_title("Daily new followers")
+ax1.set_ylabel("Followers")
+st.pyplot(fig1)
+
+# --- 7b. Monthly bar --- #
+fig2, ax2 = plt.subplots(figsize=(12, 4))
+monthly.astype(int).plot(kind="bar", ax=ax2, color="skyblue")
+ax2.set_title("Monthly new followers")
+ax2.set_ylabel("Followers")
+plt.xticks(rotation=45)
+st.pyplot(fig2)
+
+# --- 7c. Cumulative history + forecasts --- #
+fig3, ax3 = plt.subplots(figsize=(14, 6))
+# historical
+ax3.plot(df["Date"], df["Cumu_followers"], "ko-", label="Historical", markersize=3)
+# LR trend line
+all_dates = pd.date_range(start=df["Date"].min(), end=target_date)
+all_days = np.arange(1, len(all_dates) + 1)
+lr_trend = lr.predict(all_days.reshape(-1, 1))
+ax3.plot(all_dates, lr_trend, "r-", alpha=0.7, label="LR trend")
+# LR prediction + band
+ax3.axvline(target_date, color="gray", ls="--", alpha=0.5)
+ax3.errorbar(target_date, lr_pred, yerr=std_err, fmt="ro", capsize=5,
+             label="LR prediction ±1σ")
+# Prophet forecast + band
+future_part = forecast[forecast["ds"] > df["Date"].max()]
+ax3.plot(future_part["ds"], future_part["yhat"], "b-", alpha=0.7, label="Prophet forecast")
+ax3.errorbar(target_date, phat,
+             yerr=[[phat - phat_lower], [phat_upper - phat]],
+             fmt="bo", capsize=5, label="Prophet 80 %")
+ax3.set_title("Cumulative followers – history & forecasts")
+ax3.set_ylabel("Cumulative followers")
+ax3.legend()
+ax3.grid(alpha=0.3)
+plt.xticks(rotation=45)
+st.pyplot(fig3)
+
+# --- 7d. Residual diagnostics --- #
+fig4, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].scatter(lr.predict(X), residuals, alpha=0.5)
+axes[0].axhline(0, color="r", ls="--")
+axes[0].set(xlabel="Fitted", ylabel="Residuals", title="LR residuals vs fitted")
+axes[1].hist(residuals, bins=30, alpha=0.7)
+axes[1].set(xlabel="Residuals", ylabel="Freq", title="LR residual distribution")
+st.pyplot(fig4)
